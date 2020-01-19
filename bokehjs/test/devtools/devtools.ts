@@ -5,10 +5,11 @@ import fs = require("fs")
 import path = require("path")
 import {argv} from "yargs"
 import chalk from "chalk"
+import {Bar, Presets} from "cli-progress"
 
 import {State, create_baseline, load_baseline, diff_baseline} from "./baselines"
 
-const url = `file://${path.resolve(argv._[0])}`
+const url = argv._[0]
 const verbose = argv.verbose ?? false
 
 interface CallFrame {
@@ -112,20 +113,47 @@ async function run_tests(): Promise<void> {
         throw new Exit(code)
       }
 
-      async function evaluate<T>(expression: string): Promise<{value: T} | null> {
-        const {result, exceptionDetails} = await Runtime.evaluate({expression, awaitPromise: true}) // returnByValue: true
-        if (exceptionDetails == null)
-          return result.value !== undefined ? {value: result.value} : null
-        else {
-          console.log(handle_exception(exceptionDetails).text)
-          return null
+      // type Nominal<T, Name> = T & {[Symbol.species]: Name}
+
+      class Value<T> {
+        constructor(public value: T) {}
+      }
+      class Failure {
+        constructor(public text: string) {}
+      }
+      class Timeout {}
+
+      async function with_timeout<T>(promise: Promise<T>, wait: number): Promise<T | Timeout> {
+        try {
+          return await Promise.race([promise, timeout(wait)]) as T
+        } catch (err) {
+          if (err instanceof TimeoutError) {
+            return new Timeout()
+          } else {
+            throw err
+          }
+        }
+      }
+
+      async function evaluate<T>(expression: string, timeout: number = 5000): Promise<Value<T> | Failure | Timeout> {
+        const output = await with_timeout(Runtime.evaluate({expression, awaitPromise: true}), timeout)
+        if (output instanceof Timeout) {
+          return output
+        } else {
+          const {result, exceptionDetails} = output
+          if (exceptionDetails == null)
+            return new Value(result.value)
+          else {
+            const {text} = handle_exception(exceptionDetails)
+            return new Failure(text)
+          }
         }
       }
 
       async function is_ready(): Promise<boolean> {
         const expr = "typeof Bokeh !== 'undefined'"
-        const result = await evaluate(expr)
-        return result != null && result.value === true
+        const result = await evaluate<boolean>(expr)
+        return result instanceof Value && result.value
       }
 
       await Network.enable()
@@ -155,7 +183,8 @@ async function run_tests(): Promise<void> {
       handle_exceptions = false
 
       const ret = await evaluate<string>("JSON.stringify(Tests.top_level)")
-      if (ret == null) {
+      if (!(ret instanceof Value)) {
+        // TODO: Failure.text
         fail("internal error: failed to collect tests")
       }
 
@@ -163,93 +192,157 @@ async function run_tests(): Promise<void> {
       if (top_level.suites.length == 0) {
         fail("empty test suite")
       }
+      /*
 
-      const baseline_names = new Set<string>()
-      let failures = 0
-      async function run({suites, tests}: Suite, parents: Suite[], seq: number[]) {
-        for (let i = 0; i < suites.length; i++) {
-          console.log(`${"  ".repeat(seq.length)}${suites[i].description}`)
-          await run(suites[i], parents.concat(suites[i]), seq.concat(i))
+      const grep = argv.grep as string | undefined
+      const descs = parents.map((p) => p.description).concat(test.description)
+      if (grep != null && !descs.some((desc) => desc.includes(grep)))
+        continue
+      */
+
+      type Status = {
+        success?: boolean
+        failure?: boolean
+        timeout?: boolean
+        skipped?: boolean
+        errors: string[]
+      }
+
+      function* iter({suites, tests}: Suite, parents: Suite[] = []): Iterable<[Suite[], Test, Status]> {
+        for (const suite of suites) {
+          yield* iter(suite, parents.concat(suite))
         }
 
-        for (let i = 0; i < tests.length; i++) {
-          const test = tests[i]
-          const prefix = "  ".repeat(seq.length)
-
-          const grep = argv.grep as string | undefined
-          const descs = parents.map((p) => p.description).concat(test.description)
-          if (grep != null && !descs.some((desc) => desc.includes(grep)))
-            continue
-
-          console.log(`${prefix}\u2713 ${test.description}`)
-          if (test.skip) {
-            console.log(chalk.yellow("skipping"))
-            continue
-          }
-
-          //const start = Date.now()
-          const x0 = evaluate<string>(`Tests.run_test(${JSON.stringify(seq)}, ${JSON.stringify(i)})`)
-          const x1 = timeout(5000)
-          let output: {value: string} | null
-          try {
-            output = await Promise.race([x0, x1]) as any
-          } catch(err) {
-            if (err instanceof TimeoutError) {
-              console.log(chalk.blueBright("timeout"))
-              continue
-            } else {
-              throw err
-            }
-          }
-
-          if (output == null) {
-            console.log(chalk.red("test failed to run"))
-            failures++
-            continue
-          }
-
-          const result = JSON.parse((output).value) as Result
-          if (result.error != null) {
-            console.log(`${chalk.red("test failed")}: ${result.error.str}`)
-            if (result.error.stack != null) {
-              console.log(result.error.stack)
-            }
-            failures++
-            continue
-          }
-
-          if (result.state != null) {
-            const baseline_name = parents.map((suite) => suite.description).concat(test.description).map(encode).join("__")
-
-            if (baseline_names.has(baseline_name)) {
-              console.log(`${prefix}duplicated description`)
-              failures++
-            } else {
-              baseline_names.add(baseline_name)
-
-              const baseline_path = path.join("test", "baselines", baseline_name)
-              const baseline = create_baseline([result.state])
-              await fs.promises.writeFile(baseline_path, baseline)
-
-              const existing = load_baseline(baseline_path)
-              if (existing != baseline) {
-                if (existing == null)
-                  console.log(`${prefix}no baseline`)
-                const diff = diff_baseline(baseline_path)
-                console.log(diff)
-                failures++
-              }
-            }
-          }
-
-          /*
-          console.log(`${prefix}test run in ${result.time} ms`)
-          console.log(`${prefix}total run in ${Date.now() - start} ms`)
-          */
+        for (const test of tests) {
+          yield [parents, test, {errors: []}]
         }
       }
 
-      await run(top_level, [], [])
+      /*
+      if (grep != null) {
+        const descriptions = [...parents, test].map((obj) => obj.description)
+        if (!descriptions.some((description) => description.includes(grep))
+          continue
+      }
+      */
+      const test_suite = [...iter(top_level)]
+
+      const progress = new Bar({
+        format: "{bar} {percentage}% | {value} of {total}{failures}{skipped}",
+      }, Presets.shades_classic)
+
+      const baseline_names = new Set<string>()
+
+      let skipped = 0
+      let failures = 0
+
+      function to_seq(suites: Suite[], test: Test): [number[], number] {
+        let current = top_level
+        const seq = []
+        for (const suite of suites) {
+          seq.push(current.suites.indexOf(suite))
+          current = suite
+        }
+        const i = current.tests.indexOf(test)
+        return [seq, i]
+      }
+
+      function descriptions(suites: Suite[], test: Test): string[] {
+        return [...suites, test].map((obj) => obj.description)
+      }
+
+      function state(): object {
+        function format(value: number, single: string, plural?: string): string {
+          if (value == 0)
+            return ""
+          else if (value == 1)
+            return ` | 1 ${single}`
+          else
+            return ` | ${value} ${plural ?? single}`
+
+        }
+        return {
+          failures: format(failures, "failure", "failures"),
+          skipped: format(skipped, "skipped"),
+        }
+      }
+
+      progress.start(test_suite.length, 0, state())
+
+      for (const [suites, test, status] of test_suite) {
+        if (test.skip) {
+          status.skipped = true
+        } else {
+          const [seq, i] = to_seq(suites, test)
+          const output = await evaluate<string>(`Tests.run_test(${JSON.stringify(seq)}, ${JSON.stringify(i)})`)
+
+          if (output instanceof Failure) {
+            status.errors.push(output.text)
+            status.failure = true
+          } else if (output instanceof Timeout) {
+            status.timeout = true
+          } else {
+            const result = JSON.parse(output.value) as Result
+            if (result.error != null) {
+              if (result.error.stack != null) {
+                status.errors.push(result.error.stack)
+              } else {
+                status.errors.push(result.error.str)
+              }
+              status.failure = true
+            } else if (result.state != null) {
+              const baseline_name = descriptions(suites, test).map(encode).join("__")
+
+              if (baseline_names.has(baseline_name)) {
+                status.errors.push("duplicated description")
+                status.failure = true
+              } else {
+                baseline_names.add(baseline_name)
+
+                const baseline_path = path.join("test", "baselines", baseline_name)
+                const baseline = create_baseline([result.state])
+                await fs.promises.writeFile(baseline_path, baseline)
+
+                const existing = load_baseline(baseline_path)
+                if (existing != baseline) {
+                  if (existing == null) {
+                    status.errors.push("missing baseline")
+                  }
+                  const diff = diff_baseline(baseline_path)
+                  status.errors.push(diff)
+                  status.failure = true
+                }
+              }
+            }
+          }
+        }
+
+        if (status.skipped)
+          skipped++
+        if (status.failure || status.timeout)
+          failures++
+
+        progress.increment(1, state())
+      }
+
+      progress.stop()
+
+      for (const [suites, test, status] of test_suite) {
+        if (status.failure || status.timeout) {
+          console.log("")
+
+          let depth = 0
+          for (const suite of [...suites, test]) {
+            const is_last = depth == suites.length
+            const prefix = depth == 0 ? chalk.red("\u2717") : `${" ".repeat(depth)}\u2514${is_last ? "\u2500" : "\u252c"}\u2500`
+            console.log(`${prefix} ${suite.description}`)
+            depth++
+          }
+          for (const error of status.errors) {
+            console.log(error)
+          }
+        }
+      }
 
       if (failures != 0)
         throw new Exit(1)

@@ -71,6 +71,7 @@ function bundle(name: string): void {
     transpile: "ES2017",
     externals: [/^@bokehjs\//],
     prelude: default_prelude({global: "Tests"}),
+    shims: ["fs", "module"],
   })
 
   if (!argv.rebuild) linker.load_cache()
@@ -82,7 +83,7 @@ function bundle(name: string): void {
 
 function devtools(name: string): Promise<void> {
   const grep = argv.k ?? argv.grep
-  const args = ["--no-warnings", "./test/devtools", `test/${name}/index.html`, grep != null ? `--grep=${grep}` : ""]
+  const args = ["--no-warnings", "./test/devtools", `http://localhost:5777/${name}`, grep != null ? `--grep=${grep}` : ""]
   const proc = spawn(process.execPath, args, {stdio: 'inherit'})
 
   process.once('exit',    () => proc.kill())
@@ -112,9 +113,9 @@ task("test:compile", ["defaults:generate"], async () => {
 task("test:bundle", ["test:unit:bundle", "test:integration:bundle"])
 
 task("test:unit:bundle", ["test:compile"], async () => bundle("unit"))
-task("test:unit", ["test:unit:bundle"], async () => devtools("unit"))
+task("test:unit", ["test:unit:bundle"], async () => await devtools("unit"))
 
 task("test:integration:bundle", ["test:compile"], async () => bundle("integration"))
-task("test:integration", ["test:integration:bundle"], async () => devtools("integration"))
+task("test:integration", ["test:integration:bundle"], async () => await devtools("integration"))
 
 task("test", ["test:size", "test:unit", "test:integration"])
